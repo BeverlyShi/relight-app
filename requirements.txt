@@ -7,3 +7,4 @@ safetensors
 transformers
 diffusers
 torch
+rembg
