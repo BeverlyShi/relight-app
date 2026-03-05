@@ -5,7 +5,7 @@ import { LightingControls } from "./components/LightingControls";
 import { PreviewPanel } from "./components/PreviewPanel";
 
 const RELIGHT_API_BASE_URL = (
-  import.meta.env.VITE_RELIGHT_API_BASE_URL || "http://localhost:6007"
+  import.meta.env.VITE_RELIGHT_API_BASE_URL || "http://localhost:6006"
 ).replace(/\/+$/, "");
 
 export default function App() {
