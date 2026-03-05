@@ -48,16 +48,18 @@ export function LightingControls({
     const centerY = 80;
     const dx = x - centerX;
     const dy = y - centerY;
-    let calculatedAngle = Math.atan2(dy, dx) * (180 / Math.PI) + 90;
+    // Keep frontend angle definition aligned with backend:
+    // 0°=right, 90°=top, 180°=left, 270°=bottom
+    let calculatedAngle = Math.atan2(-dy, dx) * (180 / Math.PI);
     if (calculatedAngle < 0) calculatedAngle += 360;
     onAngleChange(Math.round(calculatedAngle));
   };
 
   const getIndicatorPosition = () => {
     const radius = 70;
-    const angleRad = ((angle - 90) * Math.PI) / 180;
+    const angleRad = (angle * Math.PI) / 180;
     const x = 80 + radius * Math.cos(angleRad);
-    const y = 80 + radius * Math.sin(angleRad);
+    const y = 80 - radius * Math.sin(angleRad);
     return { x, y };
   };
 
