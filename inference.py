@@ -125,16 +125,28 @@ def make_bg_from_angle(angle_deg, image_width, image_height):
     return np.stack([brightness] * 3, axis=-1)
 
 @torch.inference_mode()
-def segment_foreground(image: Image.Image):
+def segment_foreground(image: Image.Image, seed: int = 12345):
+    """用 BiRefNet 分割前景，返回灰色背景的前景图和 mask"""
     orig_w, orig_h = image.size
+
     input_tensor = birefnet_transform(image).unsqueeze(0).to(device)
     preds = birefnet(input_tensor)[-1].sigmoid()
     mask = preds[0].squeeze().cpu().numpy()
+
     mask_img = Image.fromarray((mask * 255).astype(np.uint8)).resize((orig_w, orig_h), Image.LANCZOS)
-    mask_np = np.array(mask_img)
-    fg_rgba = image.convert("RGBA")
-    fg_rgba.putalpha(mask_img)
-    return fg_rgba, mask_np
+    mask_np = np.array(mask_img) / 255.0  # 0~1
+
+    # 官方做法：背景填充随机灰色，而不是黑色
+    # 这样模型能更好理解前景边界，人物一致性更好
+    rng = np.random.RandomState(seed)
+    bg_color = rng.randint(100, 200)
+
+    img_np = np.array(image.convert("RGB")).astype(np.float32)
+    mask_3ch = np.stack([mask_np] * 3, axis=-1)
+    fg_with_gray_bg = img_np * mask_3ch + bg_color * (1 - mask_3ch)
+    fg_with_gray_bg = fg_with_gray_bg.clip(0, 255).astype(np.uint8)
+
+    return Image.fromarray(fg_with_gray_bg), mask_np
 
 @torch.inference_mode()
 def encode_prompt_inner(txt: str):
@@ -182,16 +194,11 @@ def run_relight(
     lowres_denoise: float = 0.9,
 ) -> Image.Image:
 
-    # 1. 保存原始背景
-    original_image = image.copy().resize((image_width, image_height))
+    # 1. BiRefNet 分割前景，背景填充灰色（官方做法）
+    fg_with_gray_bg, mask_np = segment_foreground(image, seed=seed)
+    fg_rgb = fg_with_gray_bg.resize((image_width, image_height))
 
-    # 2. BiRefNet 分割前景
-    fg_rgba, mask_np = segment_foreground(image)
-    fg_rgb = fg_rgba.convert("RGB").resize((image_width, image_height))
-    mask_resized = Image.fromarray(mask_np).resize((image_width, image_height), Image.LANCZOS)
-    mask_np_resized = np.array(mask_resized) / 255.0
-
-    # 3. IC-Light 对前景打光
+    # 2. IC-Light 推理
     img_np = np.array(fg_rgb).astype(np.uint8)
 
     conds, unconds = encode_prompt_pair(
@@ -261,14 +268,6 @@ def run_relight(
 
     pixels_final = vae.decode(latents_hr).sample
     results = pytorch2numpy(pixels_final)
-    relit_image = Image.fromarray(results[0])
 
-    # 4. 合成回原始背景
-    relit_resized = relit_image.resize((image_width, image_height))
-    mask_3ch = np.stack([mask_np_resized] * 3, axis=-1)
-    orig_np = np.array(original_image).astype(np.float32)
-    relit_np = np.array(relit_resized).astype(np.float32)
-    composite = relit_np * mask_3ch + orig_np * (1 - mask_3ch)
-    composite = composite.clip(0, 255).astype(np.uint8)
-
-    return Image.fromarray(composite)
+    # 3. 官方做法：直接返回模型输出，背景由模型重新生成
+    return Image.fromarray(results[0])
