@@ -115,7 +115,7 @@ def pytorch2numpy(imgs):
 def make_bg_from_angle(angle_deg, image_width, image_height):
     angle_rad = math.radians(angle_deg)
     dx = math.cos(angle_rad)
-    dy = -math.sin(angle_rad)
+    dy = math.sin(angle_rad)
     x_coords = np.linspace(-1, 1, image_width)
     y_coords = np.linspace(1, -1, image_height)
     xx, yy = np.meshgrid(x_coords, y_coords)
