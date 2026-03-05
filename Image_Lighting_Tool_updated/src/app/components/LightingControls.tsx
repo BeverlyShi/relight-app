@@ -37,10 +37,10 @@ export function LightingControls({
 }: LightingControlsProps) {
   
   const presets = [
-    { name: '顶光', angle: 0, icon: ArrowUp },
-    { name: '右光', angle: 90, icon: ArrowRight },
-    { name: '底光', angle: 180, icon: ArrowDown },
-    { name: '左光', angle: 270, icon: ArrowLeft },
+    { name: '顶光', angle: 90,  icon: ArrowUp },
+    { name: '右光', angle: 0,   icon: ArrowRight },
+    { name: '底光', angle: 270, icon: ArrowDown },
+    { name: '左光', angle: 180, icon: ArrowLeft },
   ];
 
   const handleDirectionClick = (x: number, y: number) => {
