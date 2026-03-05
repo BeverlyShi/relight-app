@@ -6,8 +6,6 @@ from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
-# ── Mock 模式 ──────────────────────────────────────
-# 本地开发时设置环境变量 MOCK=1，不加载模型，返回假图片
 MOCK = os.environ.get("MOCK", "0") == "1"
 
 if not MOCK:
@@ -15,10 +13,8 @@ if not MOCK:
 else:
     print("⚠️  MOCK 模式：不加载模型，返回原图")
     def run_relight(image, **kwargs):
-        # mock 模式直接返回原图，方便本地调试接口逻辑
         return image
 
-# ── FastAPI ───────────────────────────────────────
 app = FastAPI()
 
 app.add_middleware(
@@ -36,8 +32,6 @@ def health():
 async def relight_api(
     file: UploadFile,
     angle: float = Form(0.0),
-    brightness: float = Form(50.0),
-    temperature: float = Form(5000.0),
     prompt: str = Form("natural lighting"),
     negative_prompt: str = Form("lowres, bad anatomy, bad hands, cropped, worst quality"),
     steps: int = Form(25),
@@ -51,8 +45,6 @@ async def relight_api(
     result = run_relight(
         image=image,
         angle_deg=angle,
-        brightness=brightness,
-        temperature=temperature,
         prompt=prompt,
         negative_prompt=negative_prompt,
         steps=steps,
@@ -67,6 +59,4 @@ async def relight_api(
     return StreamingResponse(buf, media_type="image/png")
 
 if __name__ == "__main__":
-    host = os.environ.get("RELIGHT_HOST", "0.0.0.0")
-    port = int(os.environ.get("RELIGHT_PORT", os.environ.get("PORT", "6007")))
-    uvicorn.run(app, host=host, port=port)
+    uvicorn.run(app, host="0.0.0.0", port=6006)

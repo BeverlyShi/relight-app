@@ -1,5 +1,4 @@
 import math
-import os
 import numpy as np
 import torch
 import safetensors.torch as sf
@@ -9,17 +8,18 @@ from PIL import Image
 from diffusers import StableDiffusionPipeline, StableDiffusionImg2ImgPipeline
 from diffusers import AutoencoderKL, UNet2DConditionModel, DPMSolverMultistepScheduler
 from diffusers.models.attention_processor import AttnProcessor2_0
-from transformers import CLIPTextModel, CLIPTokenizer
+from transformers import CLIPTextModel, CLIPTokenizer, AutoModelForImageSegmentation
+from torchvision import transforms
 
-MODEL_DIR = Path(os.environ.get("RELIGHT_MODEL_DIR", "/root/autodl-tmp/models"))
-SD15_NAME = os.environ.get(
-    "RELIGHT_SD15_NAME",
-    "/root/autodl-tmp/models/realistic-vision/AI-ModelScope/realistic-vision-v51",
-)
-IC_LIGHT_PATH = os.environ.get("RELIGHT_IC_LIGHT_PATH", str(MODEL_DIR / "iclight_sd15_fc.safetensors"))
-device = torch.device(os.environ.get("RELIGHT_DEVICE", "cuda"))
+# ── 路径配置 ──────────────────────────────────────
+MODEL_DIR = Path("/root/autodl-tmp/models")
+SD15_NAME = str(MODEL_DIR / "realistic-vision/AI-ModelScope/realistic-vision-v51")
+IC_LIGHT_PATH = str(MODEL_DIR / "iclight_sd15_fc.safetensors")
+BIREFNET_PATH = str(MODEL_DIR / "BiRefNet")
+device = torch.device("cuda")
 
-print("加载模型中...")
+# ── 加载 IC-Light 模型 ────────────────────────────
+print("加载 IC-Light 模型中...")
 
 tokenizer = CLIPTokenizer.from_pretrained(SD15_NAME, subfolder="tokenizer")
 text_encoder = CLIPTextModel.from_pretrained(SD15_NAME, subfolder="text_encoder")
@@ -61,9 +61,7 @@ unet = unet.to(device=device, dtype=torch.float16)
 unet.set_attn_processor(AttnProcessor2_0())
 vae.set_attn_processor(AttnProcessor2_0())
 
-scheduler = DPMSolverMultistepScheduler.from_pretrained(
-    SD15_NAME, subfolder="scheduler"
-)
+scheduler = DPMSolverMultistepScheduler.from_pretrained(SD15_NAME, subfolder="scheduler")
 scheduler.config.algorithm_type = "sde-dpmsolver++"
 scheduler.config.use_karras_sigmas = True
 
@@ -78,8 +76,27 @@ i2i_pipe = StableDiffusionImg2ImgPipeline(
     feature_extractor=None, image_encoder=None
 )
 
-print("✅ 模型加载完成")
+print("✅ IC-Light 模型加载完成")
 
+# ── 加载 BiRefNet ─────────────────────────────────
+print("加载 BiRefNet 模型中...")
+
+birefnet = AutoModelForImageSegmentation.from_pretrained(
+    BIREFNET_PATH, trust_remote_code=True
+)
+birefnet = birefnet.to(device=device, dtype=torch.float32)
+birefnet.eval()
+
+birefnet_transform = transforms.Compose([
+    transforms.Resize((1024, 1024)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+])
+
+print("✅ BiRefNet 模型加载完成")
+
+
+# ── 工具函数 ──────────────────────────────────────
 
 def numpy2pytorch(imgs):
     h = torch.from_numpy(np.stack(imgs, axis=0)).float() / 127.0 - 1.0
@@ -95,33 +112,29 @@ def pytorch2numpy(imgs):
         results.append(y)
     return results
 
-def _clamp(value, min_value, max_value):
-    return max(min_value, min(max_value, value))
-
-def make_bg_from_angle(angle_deg, image_width, image_height, brightness=50.0, temperature=5000.0):
+def make_bg_from_angle(angle_deg, image_width, image_height):
     angle_rad = math.radians(angle_deg)
     dx = math.cos(angle_rad)
     dy = -math.sin(angle_rad)
     x_coords = np.linspace(-1, 1, image_width)
     y_coords = np.linspace(1, -1, image_height)
     xx, yy = np.meshgrid(x_coords, y_coords)
-    brightness_map = xx * dx + yy * dy
-    brightness_map = (brightness_map - brightness_map.min()) / (brightness_map.max() - brightness_map.min())
+    brightness = xx * dx + yy * dy
+    brightness = (brightness - brightness.min()) / (brightness.max() - brightness.min())
+    brightness = (brightness * 255).astype(np.uint8)
+    return np.stack([brightness] * 3, axis=-1)
 
-    # 50 是中性值，不改变默认效果
-    brightness_factor = _clamp(brightness / 50.0, 0.2, 2.0)
-    brightness_map = np.clip(brightness_map * brightness_factor, 0.0, 1.0)
-
-    # 5000K 是中性值，偏低更暖，偏高更冷
-    temperature_norm = _clamp((temperature - 5000.0) / 3000.0, -1.0, 1.0)
-    red_scale = 1.0 + max(0.0, -temperature_norm) * 0.22
-    blue_scale = 1.0 + max(0.0, temperature_norm) * 0.22
-
-    r = np.clip(brightness_map * red_scale, 0.0, 1.0)
-    g = brightness_map
-    b = np.clip(brightness_map * blue_scale, 0.0, 1.0)
-    bg = np.stack([r, g, b], axis=-1)
-    return (bg * 255).astype(np.uint8)
+@torch.inference_mode()
+def segment_foreground(image: Image.Image):
+    orig_w, orig_h = image.size
+    input_tensor = birefnet_transform(image).unsqueeze(0).to(device)
+    preds = birefnet(input_tensor)[-1].sigmoid()
+    mask = preds[0].squeeze().cpu().numpy()
+    mask_img = Image.fromarray((mask * 255).astype(np.uint8)).resize((orig_w, orig_h), Image.LANCZOS)
+    mask_np = np.array(mask_img)
+    fg_rgba = image.convert("RGBA")
+    fg_rgba.putalpha(mask_img)
+    return fg_rgba, mask_np
 
 @torch.inference_mode()
 def encode_prompt_inner(txt: str):
@@ -152,12 +165,11 @@ def encode_prompt_pair(positive_prompt, negative_prompt):
     uc = torch.cat([p[None, ...] for p in uc], dim=1)
     return c, uc
 
+
 @torch.inference_mode()
 def run_relight(
     image: Image.Image,
     angle_deg: float = 0.0,
-    brightness: float = 50.0,
-    temperature: float = 5000.0,
     prompt: str = "natural lighting",
     negative_prompt: str = "lowres, bad anatomy, bad hands, cropped, worst quality",
     steps: int = 25,
@@ -170,7 +182,17 @@ def run_relight(
     lowres_denoise: float = 0.9,
 ) -> Image.Image:
 
-    img_np = np.array(image.resize((image_width, image_height))).astype(np.uint8)
+    # 1. 保存原始背景
+    original_image = image.copy().resize((image_width, image_height))
+
+    # 2. BiRefNet 分割前景
+    fg_rgba, mask_np = segment_foreground(image)
+    fg_rgb = fg_rgba.convert("RGB").resize((image_width, image_height))
+    mask_resized = Image.fromarray(mask_np).resize((image_width, image_height), Image.LANCZOS)
+    mask_np_resized = np.array(mask_resized) / 255.0
+
+    # 3. IC-Light 对前景打光
+    img_np = np.array(fg_rgb).astype(np.uint8)
 
     conds, unconds = encode_prompt_pair(
         positive_prompt=prompt + ", best quality",
@@ -182,16 +204,11 @@ def run_relight(
     concat_conds = numpy2pytorch([img_np]).to(device=vae.device, dtype=vae.dtype)
     concat_conds = vae.encode(concat_conds).latent_dist.mode() * vae.config.scaling_factor
 
-    input_bg = make_bg_from_angle(
-        angle_deg=angle_deg,
-        image_width=image_width,
-        image_height=image_height,
-        brightness=brightness,
-        temperature=temperature,
-    )
+    input_bg = make_bg_from_angle(angle_deg, image_width, image_height)
     bg_latent = numpy2pytorch([input_bg]).to(device=vae.device, dtype=vae.dtype)
     bg_latent = vae.encode(bg_latent).latent_dist.mode() * vae.config.scaling_factor
 
+    # 第一阶段
     latents = i2i_pipe(
         image=bg_latent,
         strength=lowres_denoise,
@@ -210,6 +227,7 @@ def run_relight(
     pixels = vae.decode(latents).sample
     pixels = pytorch2numpy(pixels)
 
+    # 放大
     hr_width  = int(round(image_width  * highres_scale / 64.0) * 64)
     hr_height = int(round(image_height * highres_scale / 64.0) * 64)
     pixels_hr = [
@@ -217,7 +235,7 @@ def run_relight(
         for p in pixels
     ]
 
-    fg_hr = np.array(image.resize((hr_width, hr_height))).astype(np.uint8)
+    fg_hr = np.array(fg_rgb.resize((hr_width, hr_height))).astype(np.uint8)
     concat_conds_hr = numpy2pytorch([fg_hr]).to(device=vae.device, dtype=vae.dtype)
     concat_conds_hr = vae.encode(concat_conds_hr).latent_dist.mode() * vae.config.scaling_factor
 
@@ -225,6 +243,7 @@ def run_relight(
     latents_hr = vae.encode(pixels_tensor).latent_dist.mode() * vae.config.scaling_factor
     latents_hr = latents_hr.to(device=unet.device, dtype=unet.dtype)
 
+    # 第二阶段
     latents_hr = i2i_pipe(
         image=latents_hr,
         strength=highres_denoise,
@@ -242,4 +261,14 @@ def run_relight(
 
     pixels_final = vae.decode(latents_hr).sample
     results = pytorch2numpy(pixels_final)
-    return Image.fromarray(results[0])
+    relit_image = Image.fromarray(results[0])
+
+    # 4. 合成回原始背景
+    relit_resized = relit_image.resize((image_width, image_height))
+    mask_3ch = np.stack([mask_np_resized] * 3, axis=-1)
+    orig_np = np.array(original_image).astype(np.float32)
+    relit_np = np.array(relit_resized).astype(np.float32)
+    composite = relit_np * mask_3ch + orig_np * (1 - mask_3ch)
+    composite = composite.clip(0, 255).astype(np.uint8)
+
+    return Image.fromarray(composite)
