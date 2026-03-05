@@ -61,8 +61,6 @@ unet = unet.to(device=device, dtype=torch.float16)
 unet.set_attn_processor(AttnProcessor2_0())
 vae.set_attn_processor(AttnProcessor2_0())
 
-
-pip install diffusers==0.27.2 --break-system-packages  # 先恢复原版本
 scheduler = DPMSolverMultistepScheduler.from_pretrained(
     SD15_NAME, subfolder="scheduler"
 )
