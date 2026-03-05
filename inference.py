@@ -12,7 +12,19 @@ from transformers import CLIPTextModel, CLIPTokenizer, AutoModelForImageSegmenta
 from torchvision import transforms
 
 # ── 路径配置 ──────────────────────────────────────
-MODEL_DIR = Path("/root/autodl-tmp/models")
+# 优先从环境变量读取，如果没有则按以下顺序查找：
+# 1. 默认 AutoDL 环境: /root/autodl-tmp/models/
+# 2. 备用相对路径: ./models/
+import os
+
+env_model_dir = os.environ.get("MODEL_DIR", "")
+if env_model_dir and os.path.exists(env_model_dir):
+    MODEL_DIR = Path(env_model_dir)
+elif os.path.exists("/root/autodl-tmp/models"):
+    MODEL_DIR = Path("/root/autodl-tmp/models")
+else:
+    MODEL_DIR = Path("./models").resolve()
+
 SD15_NAME = str(MODEL_DIR / "realistic-vision/AI-ModelScope/realistic-vision-v51")
 IC_LIGHT_PATH = str(MODEL_DIR / "iclight_sd15_fc.safetensors")
 BIREFNET_PATH = str(MODEL_DIR / "BiRefNet")
