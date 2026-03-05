@@ -1,4 +1,5 @@
 import math
+import os
 import numpy as np
 import torch
 import safetensors.torch as sf
@@ -10,10 +11,13 @@ from diffusers import AutoencoderKL, UNet2DConditionModel, DPMSolverMultistepSch
 from diffusers.models.attention_processor import AttnProcessor2_0
 from transformers import CLIPTextModel, CLIPTokenizer
 
-MODEL_DIR = Path("/root/autodl-tmp/models")
-SD15_NAME = "/root/autodl-tmp/models/realistic-vision/AI-ModelScope/realistic-vision-v51"
-IC_LIGHT_PATH = str(MODEL_DIR / "iclight_sd15_fc.safetensors")
-device = torch.device("cuda")
+MODEL_DIR = Path(os.environ.get("RELIGHT_MODEL_DIR", "/root/autodl-tmp/models"))
+SD15_NAME = os.environ.get(
+    "RELIGHT_SD15_NAME",
+    "/root/autodl-tmp/models/realistic-vision/AI-ModelScope/realistic-vision-v51",
+)
+IC_LIGHT_PATH = os.environ.get("RELIGHT_IC_LIGHT_PATH", str(MODEL_DIR / "iclight_sd15_fc.safetensors"))
+device = torch.device(os.environ.get("RELIGHT_DEVICE", "cuda"))
 
 print("加载模型中...")
 
@@ -94,17 +98,33 @@ def pytorch2numpy(imgs):
         results.append(y)
     return results
 
-def make_bg_from_angle(angle_deg, image_width, image_height):
+def _clamp(value, min_value, max_value):
+    return max(min_value, min(max_value, value))
+
+def make_bg_from_angle(angle_deg, image_width, image_height, brightness=50.0, temperature=5000.0):
     angle_rad = math.radians(angle_deg)
     dx = math.cos(angle_rad)
     dy = math.sin(angle_rad)
     x_coords = np.linspace(-1, 1, image_width)
     y_coords = np.linspace(1, -1, image_height)
     xx, yy = np.meshgrid(x_coords, y_coords)
-    brightness = xx * dx + yy * dy
-    brightness = (brightness - brightness.min()) / (brightness.max() - brightness.min())
-    brightness = (brightness * 255).astype(np.uint8)
-    return np.stack([brightness] * 3, axis=-1)
+    brightness_map = xx * dx + yy * dy
+    brightness_map = (brightness_map - brightness_map.min()) / (brightness_map.max() - brightness_map.min())
+
+    # 50 是中性值，不改变默认效果
+    brightness_factor = _clamp(brightness / 50.0, 0.2, 2.0)
+    brightness_map = np.clip(brightness_map * brightness_factor, 0.0, 1.0)
+
+    # 5000K 是中性值，偏低更暖，偏高更冷
+    temperature_norm = _clamp((temperature - 5000.0) / 3000.0, -1.0, 1.0)
+    red_scale = 1.0 + max(0.0, -temperature_norm) * 0.22
+    blue_scale = 1.0 + max(0.0, temperature_norm) * 0.22
+
+    r = np.clip(brightness_map * red_scale, 0.0, 1.0)
+    g = brightness_map
+    b = np.clip(brightness_map * blue_scale, 0.0, 1.0)
+    bg = np.stack([r, g, b], axis=-1)
+    return (bg * 255).astype(np.uint8)
 
 @torch.inference_mode()
 def encode_prompt_inner(txt: str):
@@ -139,6 +159,8 @@ def encode_prompt_pair(positive_prompt, negative_prompt):
 def run_relight(
     image: Image.Image,
     angle_deg: float = 0.0,
+    brightness: float = 50.0,
+    temperature: float = 5000.0,
     prompt: str = "natural lighting",
     negative_prompt: str = "lowres, bad anatomy, bad hands, cropped, worst quality",
     steps: int = 25,
@@ -163,7 +185,13 @@ def run_relight(
     concat_conds = numpy2pytorch([img_np]).to(device=vae.device, dtype=vae.dtype)
     concat_conds = vae.encode(concat_conds).latent_dist.mode() * vae.config.scaling_factor
 
-    input_bg = make_bg_from_angle(angle_deg, image_width, image_height)
+    input_bg = make_bg_from_angle(
+        angle_deg=angle_deg,
+        image_width=image_width,
+        image_height=image_height,
+        brightness=brightness,
+        temperature=temperature,
+    )
     bg_latent = numpy2pytorch([input_bg]).to(device=vae.device, dtype=vae.dtype)
     bg_latent = vae.encode(bg_latent).latent_dist.mode() * vae.config.scaling_factor
 

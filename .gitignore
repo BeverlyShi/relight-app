@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+
+Image_Lighting_Tool_updated/dist/
+Image_Lighting_Tool_updated/node_modules/
+Image_Lighting_Tool_updated/.env

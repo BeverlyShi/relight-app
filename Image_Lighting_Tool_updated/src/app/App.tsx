@@ -4,6 +4,10 @@ import { ImageUploader } from "./components/ImageUploader";
 import { LightingControls } from "./components/LightingControls";
 import { PreviewPanel } from "./components/PreviewPanel";
 
+const RELIGHT_API_BASE_URL = (
+  import.meta.env.VITE_RELIGHT_API_BASE_URL || "http://localhost:6007"
+).replace(/\/+$/, "");
+
 export default function App() {
   const [uploadedImage, setUploadedImage] = useState<string | null>(null);
   const [uploadedFile, setUploadedFile] = useState<File | null>(null);
@@ -56,10 +60,12 @@ export default function App() {
       formData.append("prompt", prompt || "natural lighting");
       formData.append("steps", "25");
       formData.append("cfg", String((intensity / 100) * 4));
+      formData.append("brightness", String(brightness));
+      formData.append("temperature", String(temperature));
       formData.append("seed", "12345");
       formData.append("highres_denoise", "0.3");
 
-      const response = await fetch("http://localhost:6007/relight", {
+      const response = await fetch(`${RELIGHT_API_BASE_URL}/relight`, {
         method: "POST",
         body: formData,
       });
@@ -80,7 +86,7 @@ export default function App() {
     } finally {
       setTimeout(() => setIsGenerating(false), 300);
     }
-  }, [uploadedFile, angle, prompt, intensity]);
+  }, [uploadedFile, angle, prompt, intensity, brightness, temperature]);
 
   const handleGenerate = useCallback(() => {
     if (!uploadedFile) return;

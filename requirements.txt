@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+pillow
+requests
+numpy
+safetensors
+transformers
+diffusers
+torch
