@@ -5,11 +5,11 @@ import torch
 import safetensors.torch as sf
 
 from pathlib import Path
-from PIL import Image, ImageFilter
+from PIL import Image
 from diffusers import StableDiffusionPipeline, StableDiffusionImg2ImgPipeline
 from diffusers import AutoencoderKL, UNet2DConditionModel, DPMSolverMultistepScheduler
 from diffusers.models.attention_processor import AttnProcessor2_0
-from transformers import CLIPTextModel, CLIPTokenizer, AutoModelForImageSegmentation
+from transformers import CLIPTextModel, CLIPTokenizer
 
 MODEL_DIR = Path(os.environ.get("RELIGHT_MODEL_DIR", "/root/autodl-tmp/models"))
 SD15_NAME = os.environ.get(
@@ -18,15 +18,6 @@ SD15_NAME = os.environ.get(
 )
 IC_LIGHT_PATH = os.environ.get("RELIGHT_IC_LIGHT_PATH", str(MODEL_DIR / "iclight_sd15_fc.safetensors"))
 device = torch.device(os.environ.get("RELIGHT_DEVICE", "cuda"))
-FOREGROUND_RELIGHT_ONLY = os.environ.get("RELIGHT_FOREGROUND_RELIGHT_ONLY", "1") == "1"
-SEG_MASK_BLUR = float(os.environ.get("RELIGHT_SEG_MASK_BLUR", "1.5"))
-SEG_BACKEND = os.environ.get("RELIGHT_SEG_BACKEND", "auto").lower()  # auto | birefnet | rembg | none
-BIREFNET_PATH = os.environ.get("RELIGHT_BIREFNET_PATH", str(MODEL_DIR / "BiRefNet"))
-_rembg_session = None
-_birefnet_model = None
-_birefnet_transform = None
-_warned_birefnet = False
-_warned_rembg = False
 
 print("加载模型中...")
 
@@ -70,14 +61,13 @@ unet = unet.to(device=device, dtype=torch.float16)
 unet.set_attn_processor(AttnProcessor2_0())
 vae.set_attn_processor(AttnProcessor2_0())
 
-scheduler = DPMSolverMultistepScheduler(
-    num_train_timesteps=1000,
-    beta_start=0.00085,
-    beta_end=0.012,
-    algorithm_type="sde-dpmsolver++",
-    use_karras_sigmas=True,
-    steps_offset=1
+
+pip install diffusers==0.27.2 --break-system-packages  # 先恢复原版本
+scheduler = DPMSolverMultistepScheduler.from_pretrained(
+    SD15_NAME, subfolder="scheduler"
 )
+scheduler.config.algorithm_type = "sde-dpmsolver++"
+scheduler.config.use_karras_sigmas = True
 
 t2i_pipe = StableDiffusionPipeline(
     vae=vae, text_encoder=text_encoder, tokenizer=tokenizer, unet=unet,
@@ -110,94 +100,10 @@ def pytorch2numpy(imgs):
 def _clamp(value, min_value, max_value):
     return max(min_value, min(max_value, value))
 
-def _load_birefnet():
-    global _birefnet_model, _birefnet_transform
-    if _birefnet_model is not None and _birefnet_transform is not None:
-        return _birefnet_model, _birefnet_transform
-
-    from torchvision import transforms
-
-    model = AutoModelForImageSegmentation.from_pretrained(
-        BIREFNET_PATH,
-        trust_remote_code=True,
-    )
-    model = model.to(device=device, dtype=torch.float32)
-    model.eval()
-    transform = transforms.Compose([
-        transforms.Resize((1024, 1024)),
-        transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-    ])
-    _birefnet_model = model
-    _birefnet_transform = transform
-    return _birefnet_model, _birefnet_transform
-
-@torch.inference_mode()
-def _extract_mask_birefnet(image: Image.Image):
-    model, transform = _load_birefnet()
-    orig_w, orig_h = image.size
-    input_tensor = transform(image).unsqueeze(0).to(device)
-    preds = model(input_tensor)[-1].sigmoid()
-    mask = preds[0].squeeze().detach().cpu().numpy()
-    mask_img = Image.fromarray((mask * 255).astype(np.uint8)).resize((orig_w, orig_h), Image.BILINEAR)
-    return np.array(mask_img, dtype=np.float32) / 255.0
-
-def _extract_mask_rembg(image: Image.Image):
-    try:
-        from rembg import remove, new_session
-        global _rembg_session
-        if _rembg_session is None:
-            _rembg_session = new_session("u2net")
-        rgba = remove(image, session=_rembg_session)
-        alpha = np.array(rgba.split()[-1], dtype=np.float32) / 255.0
-        # Slight smoothing to avoid hard cut edges after compositing.
-        if blur_radius > 0:
-            mask_img = Image.fromarray((alpha * 255).astype(np.uint8)).filter(
-                ImageFilter.GaussianBlur(radius=blur_radius)
-            )
-            alpha = np.array(mask_img, dtype=np.float32) / 255.0
-        return np.clip(alpha, 0.0, 1.0)
-    except Exception as exc:
-        global _warned_rembg
-        if not _warned_rembg:
-            print(f"⚠️ rembg 分割不可用，回退：{exc}")
-            _warned_rembg = True
-        return None
-
-def _extract_foreground_mask(image: Image.Image):
-    """Return a soft foreground mask in [0,1]. Falls back to full mask if segmentation is unavailable."""
-    if SEG_BACKEND in ("birefnet", "auto"):
-        try:
-            mask = _extract_mask_birefnet(image)
-            if mask is not None:
-                return np.clip(mask, 0.0, 1.0)
-        except Exception as exc:
-            global _warned_birefnet
-            if not _warned_birefnet:
-                print(f"⚠️ BiRefNet 分割不可用，回退：{exc}")
-                _warned_birefnet = True
-
-    if SEG_BACKEND in ("rembg", "auto"):
-        mask = _extract_mask_rembg(image)
-        if mask is not None:
-            return np.clip(mask, 0.0, 1.0)
-
-    if SEG_BACKEND == "none":
-        return np.ones((image.height, image.width), dtype=np.float32)
-
-    # Final fallback: keep service available even if all segmentation backends fail.
-    return np.ones((image.height, image.width), dtype=np.float32)
-
-def _composite_with_mask(relit_rgb, original_rgb, mask):
-    """Blend relit foreground with original background using a soft mask."""
-    mask3 = np.repeat(mask[..., None], 3, axis=2)
-    out = relit_rgb.astype(np.float32) * mask3 + original_rgb.astype(np.float32) * (1.0 - mask3)
-    return np.clip(out, 0, 255).astype(np.uint8)
-
 def make_bg_from_angle(angle_deg, image_width, image_height, brightness=50.0, temperature=5000.0):
     angle_rad = math.radians(angle_deg)
     dx = math.cos(angle_rad)
-    dy = - math.sin(angle_rad)
+    dy = -math.sin(angle_rad)
     x_coords = np.linspace(-1, 1, image_width)
     y_coords = np.linspace(1, -1, image_height)
     xx, yy = np.meshgrid(x_coords, y_coords)
@@ -267,9 +173,6 @@ def run_relight(
 ) -> Image.Image:
 
     img_np = np.array(image.resize((image_width, image_height))).astype(np.uint8)
-    mask_lr = _extract_foreground_mask(Image.fromarray(img_np)) if FOREGROUND_RELIGHT_ONLY else np.ones((image_height, image_width), dtype=np.float32)
-    # Keep background neutral in the condition image so the model focuses relighting on the subject.
-    cond_np = _composite_with_mask(img_np, np.full_like(img_np, 127), mask_lr)
 
     conds, unconds = encode_prompt_pair(
         positive_prompt=prompt + ", best quality",
@@ -278,7 +181,7 @@ def run_relight(
 
     rng = torch.Generator(device=device).manual_seed(seed)
 
-    concat_conds = numpy2pytorch([cond_np]).to(device=vae.device, dtype=vae.dtype)
+    concat_conds = numpy2pytorch([img_np]).to(device=vae.device, dtype=vae.dtype)
     concat_conds = vae.encode(concat_conds).latent_dist.mode() * vae.config.scaling_factor
 
     input_bg = make_bg_from_angle(
@@ -308,8 +211,6 @@ def run_relight(
 
     pixels = vae.decode(latents).sample
     pixels = pytorch2numpy(pixels)
-    if FOREGROUND_RELIGHT_ONLY:
-        pixels = [_composite_with_mask(p, img_np, mask_lr) for p in pixels]
 
     hr_width  = int(round(image_width  * highres_scale / 64.0) * 64)
     hr_height = int(round(image_height * highres_scale / 64.0) * 64)
@@ -319,15 +220,7 @@ def run_relight(
     ]
 
     fg_hr = np.array(image.resize((hr_width, hr_height))).astype(np.uint8)
-    if FOREGROUND_RELIGHT_ONLY:
-        mask_hr_img = Image.fromarray((mask_lr * 255).astype(np.uint8)).resize((hr_width, hr_height), Image.BILINEAR)
-        mask_hr = np.array(mask_hr_img, dtype=np.float32) / 255.0
-        cond_hr = _composite_with_mask(fg_hr, np.full_like(fg_hr, 127), mask_hr)
-    else:
-        mask_hr = np.ones((hr_height, hr_width), dtype=np.float32)
-        cond_hr = fg_hr
-
-    concat_conds_hr = numpy2pytorch([cond_hr]).to(device=vae.device, dtype=vae.dtype)
+    concat_conds_hr = numpy2pytorch([fg_hr]).to(device=vae.device, dtype=vae.dtype)
     concat_conds_hr = vae.encode(concat_conds_hr).latent_dist.mode() * vae.config.scaling_factor
 
     pixels_tensor = numpy2pytorch(pixels_hr).to(device=vae.device, dtype=vae.dtype)
@@ -351,7 +244,4 @@ def run_relight(
 
     pixels_final = vae.decode(latents_hr).sample
     results = pytorch2numpy(pixels_final)
-    if FOREGROUND_RELIGHT_ONLY:
-        final = _composite_with_mask(results[0], fg_hr, mask_hr)
-        return Image.fromarray(final)
     return Image.fromarray(results[0])
